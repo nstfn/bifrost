@@ -88,7 +88,16 @@ type ApiV1Result<T> = Result<T, ApiV1Error>;
 impl IntoResponse for ApiV1Error {
     fn into_response(self) -> Response {
         let error_msg = format!("{self}");
-        log::error!("V1 request failed: {error_msg}");
+        // Expected answers to unpaired clients (pairing polls POST /api every
+        // second): the auth middleware already logs a rejected user once
+        if matches!(
+            self,
+            Self::HueApiV1(HueApiV1Error::UnauthorizedUser | HueApiV1Error::LinkButtonNotPressed)
+        ) {
+            log::debug!("V1 request failed: {error_msg}");
+        } else {
+            log::error!("V1 request failed: {error_msg}");
+        }
 
         let res = Json(json!([
             {

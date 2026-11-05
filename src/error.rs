@@ -183,6 +183,9 @@ pub enum ApiError {
     #[error("Entertainment Stream timeout")]
     EntStreamTimeout,
 
+    #[error("Entertainment Stream rejected: unknown PSK identity")]
+    EntStreamRejected,
+
     #[error("Entertainment Stream desynchronized")]
     EntStreamDesync,
 

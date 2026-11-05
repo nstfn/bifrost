@@ -3,8 +3,8 @@ use std::convert::Infallible;
 use axum::Router;
 use axum::extract::{FromRequestParts, Path, Request, State};
 use axum::http::HeaderValue;
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -139,6 +139,18 @@ pub async fn require_v1_user(
         .find(|(name, _)| name == "user")
         .map_or("", |(_, value)| value.as_str());
     let Some(app) = auth.find_by_username(user) else {
+        // A real bridge answers GET /api/<any user>/config with the short
+        // public config, and clients read its bridgeid before they pair
+        // (lg-hue-sync calls GET /api/0/config). Keep that path open.
+        let rtype = params
+            .iter()
+            .find(|(name, _)| name == "rtype")
+            .map(|(_, value)| value.as_str());
+        let has_id = params.iter().any(|(name, _)| name == "id");
+        if req.method() == Method::GET && rtype == Some("config") && !has_id {
+            return Json(state.api_short_config().await).into_response();
+        }
+
         log::warn!("Rejected v1 request: unknown user {}", redact(user));
         return ApiV1Error::from(HueApiV1Error::UnauthorizedUser).into_response();
     };

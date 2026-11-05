@@ -40,6 +40,19 @@ use crate::server::auth_store::{AuthStore, redact};
 
 type BroadcastReceiver = tokio::sync::broadcast::Receiver<Arc<BackendRequest>>;
 
+/// OpenSSL `ERR_LIB_SSL` and `SSL_R_PSK_IDENTITY_NOT_FOUND`: the handshake
+/// failed because the PSK callback refused the client identity
+const ERR_LIB_SSL: i32 = 20;
+const SSL_R_PSK_IDENTITY_NOT_FOUND: i32 = 223;
+
+fn is_psk_rejection(err: &openssl::ssl::Error) -> bool {
+    err.ssl_error().is_some_and(|stack| {
+        stack.errors().iter().any(|e| {
+            e.library_code() == ERR_LIB_SSL && e.reason_code() == SSL_R_PSK_IDENTITY_NOT_FOUND
+        })
+    })
+}
+
 struct EntertainmentSocket {
     res: Arc<Mutex<Resources>>,
     backend_updates: Sender<Arc<BackendRequest>>,
@@ -212,7 +225,14 @@ impl EntertainmentSocket {
 
         timeout(Duration::from_secs(5), handshake)
             .await
-            .map_err(|_| ApiError::EntStreamTimeout)??;
+            .map_err(|_| ApiError::EntStreamTimeout)?
+            .map_err(|err| {
+                if is_psk_rejection(&err) {
+                    ApiError::EntStreamRejected
+                } else {
+                    err.into()
+                }
+            })?;
 
         // read the first frame, and use it to look up area, color mode, etc.
         // this means we discard the first frame, but since we expect at least
@@ -437,6 +457,10 @@ impl Service for EntertainmentService {
             tokio::spawn(async move {
                 match entertainment_socket.listen(stream).await {
                     Ok(()) => log::info!("Entertainment stream finished"),
+                    // the PSK callback already logged a warning for this
+                    Err(err @ ApiError::EntStreamRejected) => {
+                        log::debug!("Entertainment stream error: {err}");
+                    }
                     Err(err) => log::error!("Entertainment stream error: {err}"),
                 }
             });
