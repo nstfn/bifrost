@@ -1,6 +1,8 @@
 name: Docker
 
 on:
+  # nstfn fork: manual runs, to republish without a new commit.
+  workflow_dispatch:
   push:
     # nstfn fork: also publish from the fork's main branch.
     # Tags become nstfn-main-latest and nstfn-main-YYYY-MM-DD (metadata-action turns "/" into "-").
