@@ -14,13 +14,24 @@ use hue::api::{
     LightMode, RType, Resource, ResourceLink,
 };
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
 use crate::routes::auth::STANDARD_APPLICATION_ID;
 use crate::routes::clip::{ApiV2Result, V2Reply};
 use crate::server::appstate::AppState;
 
-pub async fn post_resource(state: &AppState, req: Value) -> ApiV2Result {
+pub async fn post_resource(state: &AppState, mut req: Value) -> ApiV2Result {
+    // Real-bridge clients (including the official Hue app) send the resource
+    // type in the body. Accept it when it matches, and reject a mismatch.
+    if let Some(rtype) = req.as_object_mut().and_then(|obj| obj.remove("type"))
+        && rtype != serde_json::to_value(RType::EntertainmentConfiguration)?
+    {
+        return Err(ApiError::WrongResourceType(
+            RType::EntertainmentConfiguration,
+            rtype.to_string(),
+        ));
+    }
+
     let new: EntertainmentConfigurationNew = serde_json::from_value(req)?;
 
     let mut lock = state.res.lock().await;

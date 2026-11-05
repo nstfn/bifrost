@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::common::fixture::{self, FixtureDevice, Z2mFixture};
-use crate::common::{TestBridge, TestResult};
+use crate::common::{TestBridge, TestError, TestResult};
 
 pub mod common;
 
@@ -116,5 +116,54 @@ async fn another_area_can_start_after_a_stop() -> TestResult<()> {
 
     assert_eq!(status(&bridge, first).await?, INACTIVE);
     assert_eq!(status(&bridge, second).await?, ACTIVE);
+    Ok(())
+}
+
+/// The official Hue app sends `"type"` in the body of a create request
+#[tokio::test]
+async fn create_accepts_a_matching_type_field() -> TestResult<()> {
+    let mut bridge = TestBridge::start(z2m_state()).await?;
+    let device = bridge.wait_for_device(HUE_WHITE_AMBIANCE).await?;
+    let Resource::Device(device) = &device.obj else {
+        panic!("expected a light device");
+    };
+    let service = *device
+        .entertainment_service()
+        .expect("light has an entertainment service");
+
+    let body = |rtype: &str| {
+        json!({
+            "type": rtype,
+            "configuration_type": "screen",
+            "metadata": { "name": "tv" },
+            "locations": { "service_locations": [{
+                "service": service,
+                "positions": [{ "x": 0.0, "y": 0.0, "z": 0.0 }],
+            }]},
+        })
+    };
+
+    let area = bridge
+        .hue_client
+        .post(
+            "/clip/v2/resource/entertainment_configuration",
+            &body("entertainment_configuration"),
+        )
+        .await?;
+    assert_eq!(status(&bridge, area).await?, INACTIVE);
+
+    let err = bridge
+        .hue_client
+        .post(
+            "/clip/v2/resource/entertainment_configuration",
+            &body("room"),
+        )
+        .await
+        .expect_err("a mismatching type must be rejected");
+    let TestError::Reqwest(err) = err else {
+        panic!("expected an http error, got {err:?}");
+    };
+    assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+
     Ok(())
 }

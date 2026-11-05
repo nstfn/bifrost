@@ -155,6 +155,9 @@ pub enum ApiError {
     #[error("Deleting object of type {0:?} is not allowed by hue protocol")]
     DeleteNotAllowed(RType),
 
+    #[error("Wrong resource type: expected {0:?}, found {1}")]
+    WrongResourceType(RType, String),
+
     /* bifrost errors */
     #[error("Missing auxiliary data resource {0:?}")]
     AuxNotFound(uuid::Uuid),

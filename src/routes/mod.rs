@@ -144,6 +144,8 @@ impl IntoResponse for ApiError {
 
             Self::AuxNotFound(_) => StatusCode::NOT_FOUND,
 
+            Self::WrongResourceType(_, _) => StatusCode::BAD_REQUEST,
+
             Self::CreateNotAllowed(_) | Self::UpdateNotAllowed(_) | Self::DeleteNotAllowed(_) => {
                 StatusCode::METHOD_NOT_ALLOWED
             }
