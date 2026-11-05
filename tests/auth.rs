@@ -426,3 +426,40 @@ async fn deleting_the_streaming_area_clears_the_streamer() {
     assert_eq!(status, StatusCode::OK);
     assert!(auth.psk_for_identity(id.to_string().as_bytes()).is_none());
 }
+
+#[tokio::test]
+async fn strict_unknown_user_gets_only_the_short_config() {
+    let app = TestApp::start("strict").await;
+
+    // like a real bridge: the public short config, read before pairing
+    let (status, _, json) = app.request(Method::GET, "/api/0/config", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["bridgeid"], "112233FFFE445566");
+    assert!(json.get("whitelist").is_none(), "{json}");
+    assert!(json.get("ipaddress").is_none(), "{json}");
+
+    // everything else under an unknown user stays refused
+    let (_, _, json) = app
+        .request(Method::GET, "/api/0/config/whitelist", None, None)
+        .await;
+    assert_eq!(json[0]["error"]["type"], 1);
+    let (_, _, json) = app
+        .request(
+            Method::PUT,
+            "/api/0/config",
+            None,
+            Some(json!({"name": "x"})),
+        )
+        .await;
+    assert_eq!(json[0]["error"]["type"], 1);
+
+    // a paired user still gets the full config
+    app.state.auth().press_link_button();
+    let (user, _) = app.pair().await.unwrap();
+    let (status, _, json) = app
+        .request(Method::GET, &format!("/api/{user}/config"), None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["bridgeid"], "112233FFFE445566");
+    assert!(json.get("whitelist").is_some(), "{json}");
+}
