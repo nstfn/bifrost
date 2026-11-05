@@ -237,9 +237,17 @@ async fn delete_resource_id(
             /* check that the resource exists, otherwise we should return 404 */
             lock.get_resource(&rlink)?;
 
+            let was_streaming = rlink.rtype == RType::EntertainmentConfiguration
+                && ent_conf::active_area(&lock) == Some(rlink.rid);
+
             lock.delete(&rlink)?;
 
             drop(lock);
+
+            // The DTLS PSK callback must stop accepting the streamer
+            if was_streaming {
+                state.auth().set_streamer(None);
+            }
 
             V2Reply::ok(rlink)
         }

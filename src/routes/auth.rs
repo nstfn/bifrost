@@ -31,10 +31,20 @@ pub const APPLICATION_KEY_HEADER: &str = "hue-application-key";
 
 /// The paired app that sent a request. Only present in strict mode, where
 /// the auth middleware inserts it as a request extension.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Caller {
     pub username: String,
     pub application_id: Uuid,
+}
+
+/// Never show a full username or application id
+impl std::fmt::Debug for Caller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caller")
+            .field("username", &redact(&self.username))
+            .field("application_id", &redact(&self.application_id.to_string()))
+            .finish()
+    }
 }
 
 impl From<PairedApp> for Caller {

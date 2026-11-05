@@ -32,13 +32,13 @@ use hue::legacy_api::{
 use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
 use crate::routes::auth::{
-    MaybeCaller, STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY, require_v1_user, streamer_id,
+    Caller, MaybeCaller, STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY, require_v1_user, streamer_id,
 };
 use crate::routes::clip::entertainment_configuration;
 use crate::routes::extractor::Json;
 use crate::routes::{ApiV1Error, ApiV1Result};
 use crate::server::appstate::AppState;
-use crate::server::auth_store::{AuthStore, redact};
+use crate::server::auth_store::{AuthStore, MAX_DEVICETYPE_LENGTH, redact};
 
 async fn get_api_config(State(state): State<AppState>) -> Json<impl Serialize> {
     Json(state.api_short_config().await)
@@ -53,6 +53,11 @@ async fn post_api(
 
     let auth = state.auth();
     if auth.is_strict() {
+        if json.devicetype.len() > MAX_DEVICETYPE_LENGTH {
+            warn!("Refused pairing: devicetype longer than {MAX_DEVICETYPE_LENGTH} bytes");
+            Err(HueApiV1Error::InvalidValueForParameter)?;
+        }
+
         let Some(app) = auth.pair(&json.devicetype)? else {
             Err(HueApiV1Error::LinkButtonNotPressed)?
         };
@@ -92,19 +97,23 @@ fn get_lights(res: &MutexGuard<Resources>) -> ApiResult<HashMap<String, ApiLight
     Ok(lights)
 }
 
-/// v1 stream owner: the username of the streaming app in strict mode, the
-/// standard id in open mode
-fn stream_owner(auth: &AuthStore, streamer: Uuid) -> String {
+/// v1 stream owner. Open mode: the standard id. Strict mode: the username
+/// (a secret key) only for the streaming app itself, the application id
+/// (not secret) for any other caller.
+fn stream_owner(auth: &AuthStore, streamer: Uuid, caller: Option<&Caller>) -> String {
     if !auth.is_strict() {
         return STANDARD_APPLICATION_ID.to_string();
     }
-    auth.find_by_id(streamer)
-        .map_or_else(|| streamer.to_string(), |app| app.username)
+    match caller {
+        Some(caller) if caller.application_id == streamer => caller.username.clone(),
+        _ => streamer.to_string(),
+    }
 }
 
 fn get_groups(
     res: &MutexGuard<Resources>,
     auth: &AuthStore,
+    caller: Option<&Caller>,
     group_0: bool,
 ) -> ApiResult<HashMap<String, ApiGroup>> {
     let mut rooms = HashMap::new();
@@ -202,7 +211,7 @@ fn get_groups(
                 state: ApiGroupState::default(),
                 stream: json!({
                     "active": entconf.active_streamer.is_some(),
-                    "owner": entconf.active_streamer.map(|st| stream_owner(auth, st.rid)),
+                    "owner": entconf.active_streamer.map(|st| stream_owner(auth, st.rid, caller)),
                     "proxymode": "auto",
                     "proxynode": "/bridge"
                 }),
@@ -273,12 +282,13 @@ fn get_scenes(owner: &str, res: &MutexGuard<Resources>) -> ApiV1Result<HashMap<S
 async fn get_api_user(
     state: State<AppState>,
     Path(username): Path<String>,
+    MaybeCaller(caller): MaybeCaller,
 ) -> ApiV1Result<Json<impl Serialize>> {
     let lock = state.res.lock().await;
 
     Ok(Json(ApiUserConfig {
         config: state.api_config(username.clone()).await?,
-        groups: get_groups(&lock, state.auth(), false)?,
+        groups: get_groups(&lock, state.auth(), caller.as_ref(), false)?,
         lights: get_lights(&lock)?,
         resourcelinks: HashMap::new(),
         rules: HashMap::new(),
@@ -291,12 +301,18 @@ async fn get_api_user(
 async fn get_api_user_resource(
     State(state): State<AppState>,
     Path((username, artype)): Path<(String, ApiResourceType)>,
+    MaybeCaller(caller): MaybeCaller,
 ) -> ApiV1Result<Json<Value>> {
     let lock = &state.res.lock().await;
     match artype {
         ApiResourceType::Config => Ok(Json(json!(state.api_config(username).await?))),
         ApiResourceType::Lights => Ok(Json(json!(get_lights(lock)?))),
-        ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, state.auth(), false)?))),
+        ApiResourceType::Groups => Ok(Json(json!(get_groups(
+            lock,
+            state.auth(),
+            caller.as_ref(),
+            false
+        )?))),
         ApiResourceType::Scenes => Ok(Json(json!(get_scenes(&username, lock)?))),
         ApiResourceType::Resourcelinks
         | ApiResourceType::Rules
@@ -406,6 +422,7 @@ async fn put_api_user_resource(
 async fn get_api_user_resource_id(
     State(state): State<AppState>,
     Path((username, resource, id)): Path<(String, ApiResourceType, u32)>,
+    MaybeCaller(caller): MaybeCaller,
 ) -> ApiV1Result<Json<impl Serialize>> {
     log::debug!(
         "GET v1 username={} resource={resource:?} id={id}",
@@ -431,7 +448,7 @@ async fn get_api_user_resource_id(
         }
         ApiResourceType::Groups => {
             let lock = state.res.lock().await;
-            let groups = get_groups(&lock, state.auth(), true)?;
+            let groups = get_groups(&lock, state.auth(), caller.as_ref(), true)?;
             let group = groups
                 .get(&id.to_string())
                 .ok_or(HueError::V1NotFound(id))?;

@@ -101,12 +101,16 @@ impl TestApp {
 
     /// POST /api, returns (username, clientkey) on success, or the v1 error type
     async fn pair(&self) -> Result<(String, String), u64> {
+        self.pair_as("test#auth").await
+    }
+
+    async fn pair_as(&self, devicetype: &str) -> Result<(String, String), u64> {
         let (status, _, json) = self
             .request(
                 Method::POST,
                 "/api",
                 None,
-                Some(json!({"devicetype": "test#auth", "generateclientkey": true})),
+                Some(json!({"devicetype": devicetype, "generateclientkey": true})),
             )
             .await;
         assert_eq!(status, StatusCode::OK);
@@ -320,17 +324,25 @@ async fn strict_entertainment_streamer_is_the_caller() {
     assert_eq!(json["data"][0]["active_streamer"]["rid"], id1.to_string());
     assert_eq!(json["data"][0]["active_streamer"]["rtype"], "auth_v1");
 
-    // v1 stream owner is the streaming app's username
+    // v1 stream owner: the streamer sees its own username, any other app
+    // only sees the (not secret) application id
+    let owner = |json: &Value| {
+        json.as_object()
+            .unwrap()
+            .values()
+            .find(|group| group["type"] == "Entertainment")
+            .unwrap()["stream"]["owner"]
+            .clone()
+    };
     let (_, _, json) = app
         .request(Method::GET, &format!("/api/{user2}/groups"), None, None)
         .await;
-    let group = json
-        .as_object()
-        .unwrap()
-        .values()
-        .find(|group| group["type"] == "Entertainment")
-        .unwrap();
-    assert_eq!(group["stream"]["owner"], user1.as_str());
+    assert_ne!(owner(&json), user1.as_str());
+    assert_eq!(owner(&json), id1.to_string().as_str());
+    let (_, _, json) = app
+        .request(Method::GET, &format!("/api/{user1}/groups"), None, None)
+        .await;
+    assert_eq!(owner(&json), user1.as_str());
 
     // only the streamer's identity gets a key
     assert!(auth.psk_for_identity(id1.to_string().as_bytes()).is_some());
@@ -352,4 +364,65 @@ async fn strict_entertainment_streamer_is_the_caller() {
     let (_, _, json) = app.request(Method::GET, &uri, Some(&user1), None).await;
     assert!(json["data"][0].get("active_streamer").is_none());
     assert!(auth.psk_for_identity(id1.to_string().as_bytes()).is_none());
+}
+
+#[tokio::test]
+async fn strict_devicetype_is_capped() {
+    let app = TestApp::start("strict").await;
+    app.state.auth().press_link_button();
+
+    assert_eq!(app.pair_as(&"x".repeat(65)).await, Err(7));
+    assert!(app.pair_as(&"x".repeat(64)).await.is_ok());
+}
+
+#[tokio::test]
+async fn strict_pairings_are_capped_per_press() {
+    let app = TestApp::start("strict").await;
+    app.state.auth().press_link_button();
+    for _ in 0..10 {
+        assert!(app.pair().await.is_ok());
+    }
+    assert_eq!(app.pair().await, Err(101));
+
+    app.state.auth().press_link_button();
+    assert!(app.pair().await.is_ok());
+}
+
+#[tokio::test]
+async fn deleting_the_streaming_area_clears_the_streamer() {
+    let app = TestApp::start("strict").await;
+    app.state.auth().press_link_button();
+    let (user, _) = app.pair().await.unwrap();
+    let id = app.application_id(&user);
+
+    let (_, _, json) = app
+        .request(
+            Method::POST,
+            "/clip/v2/resource/entertainment_configuration",
+            Some(&user),
+            Some(json!({
+                "configuration_type": "screen",
+                "metadata": { "name": "tv" },
+                "locations": { "service_locations": [] },
+            })),
+        )
+        .await;
+    let rid = json["data"][0]["rid"].as_str().unwrap().to_string();
+    let uri = format!("/clip/v2/resource/entertainment_configuration/{rid}");
+
+    let (status, _, _) = app
+        .request(
+            Method::PUT,
+            &uri,
+            Some(&user),
+            Some(json!({"action": "start"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let auth = app.state.auth();
+    assert!(auth.psk_for_identity(id.to_string().as_bytes()).is_some());
+
+    let (status, _, _) = app.request(Method::DELETE, &uri, Some(&user), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(auth.psk_for_identity(id.to_string().as_bytes()).is_none());
 }
