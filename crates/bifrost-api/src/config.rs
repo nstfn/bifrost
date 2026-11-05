@@ -32,6 +32,45 @@ pub struct BridgeConfig {
 pub struct BifrostConfig {
     pub state_file: Utf8PathBuf,
     pub cert_file: Utf8PathBuf,
+    /// Paired applications (only used in strict authentication mode)
+    #[serde(default = "BifrostConfig::default_auth_file")]
+    pub auth_file: Utf8PathBuf,
+}
+
+impl BifrostConfig {
+    fn default_auth_file() -> Utf8PathBuf {
+        Utf8PathBuf::from("auth.yaml")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// No authentication: every app gets the same username and key (upstream behavior)
+    #[default]
+    Open,
+    /// Apps must pair while the link button is pressed, and use their own key
+    Strict,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+    /// How long pairing stays open after the link button is pressed
+    pub link_button_seconds: u64,
+    /// Creating this file presses the virtual link button
+    pub trigger_file: Utf8PathBuf,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::default(),
+            link_button_seconds: 120,
+            trigger_file: Utf8PathBuf::from("linkbutton"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -68,6 +107,8 @@ pub struct AppConfig {
     pub bridge: BridgeConfig,
     pub z2m: Z2mConfig,
     pub bifrost: BifrostConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
     #[serde(default)]
     pub rooms: BTreeMap<String, RoomConfig>,
     // Optional in-memory Zigbee2MQTT-compatible server for tests and local development

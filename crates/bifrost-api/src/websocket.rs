@@ -7,7 +7,7 @@ use crate::service::Service;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Update {
-    AppConfig(AppConfig),
+    AppConfig(Box<AppConfig>),
     HueEvent(EventBlock),
     BackendRequest(Box<BackendRequest>),
     ServiceUpdate(Service),

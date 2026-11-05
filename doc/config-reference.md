@@ -22,6 +22,47 @@ bifrost:
   # (this might require pairing the Hue App again)
   cert_file: "cert.pem"
 
+  # name of yaml file to store paired apps in (strict auth mode only)
+  #
+  # relative paths resolve like state_file (from the working directory).
+  # the file holds secrets: bifrost writes it with mode 0600.
+  auth_file: "auth.yaml"
+
+# Auth section [optional!]
+#
+# Controls how apps authenticate to the emulated bridge.
+auth:
+  # "open" (default): upstream behavior. Every app that calls POST /api
+  # gets the same username and entertainment key, and no request is checked.
+  #
+  # "strict": like a real Hue bridge.
+  #   - POST /api only succeeds while the virtual link button is pressed
+  #     (otherwise: v1 error 101 "link button not pressed"). Each app gets
+  #     its own username, application id and entertainment client key,
+  #     stored in bifrost.auth_file.
+  #   - /api/<username>/... requires a paired username (otherwise v1 error 1).
+  #     /api/config, /api/nouser/config, /description.xml and /licenses
+  #     stay open.
+  #   - /clip/v2/resource, /eventstream/clip/v2, /auth/v1, /bifrost and
+  #     /updater require a "hue-application-key" header with a paired
+  #     username (otherwise HTTP 403).
+  #   - An entertainment (DTLS) stream is accepted only from the app that
+  #     started the entertainment area, with its own client key.
+  #
+  # To revoke an app: stop bifrost, delete its entry from auth_file, and
+  # start bifrost again.
+  mode: open
+
+  # How long pairing stays open after the link button is pressed
+  link_button_seconds: 120
+
+  # Press the virtual link button by creating this file (for example with
+  # `touch linkbutton`). Bifrost checks for it about once per second, then
+  # deletes it and opens pairing for link_button_seconds.
+  #
+  # relative paths resolve like state_file (from the working directory).
+  trigger_file: "linkbutton"
+
 # Bridge section
 #
 # Settings for hue bridge emulation
