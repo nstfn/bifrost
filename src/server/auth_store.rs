@@ -10,6 +10,7 @@
 //! DTLS PSK callback, so it uses a std [`RwLock`] (never held across an
 //! `.await`) instead of a tokio mutex.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -37,6 +38,12 @@ const USERNAME_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs
 /// Length of an entertainment client key, in bytes
 const CLIENTKEY_LENGTH: usize = 16;
 
+/// Longest accepted `devicetype` in a pairing request, in bytes
+pub const MAX_DEVICETYPE_LENGTH: usize = 64;
+
+/// Most apps that can pair during one press of the link button
+pub const MAX_PAIRINGS_PER_WINDOW: u32 = 10;
+
 /// Shorten a secret value before it goes to a log: keep at most the first 4
 /// characters.
 #[must_use]
@@ -45,7 +52,7 @@ pub fn redact(value: &str) -> String {
     format!("{prefix}…")
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairedApp {
     /// Value of the `hue-application-key` header (v2) and `{user}` path segment (v1)
     pub username: String,
@@ -55,6 +62,19 @@ pub struct PairedApp {
     pub clientkey: String,
     pub devicetype: String,
     pub created: DateTime<Utc>,
+}
+
+/// Never show a full username, application id or client key
+impl fmt::Debug for PairedApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PairedApp")
+            .field("username", &redact(&self.username))
+            .field("application_id", &redact(&self.application_id.to_string()))
+            .field("clientkey", &"<redacted>")
+            .field("devicetype", &self.devicetype)
+            .field("created", &self.created)
+            .finish()
+    }
 }
 
 impl PairedApp {
@@ -109,20 +129,59 @@ struct AuthFile {
     apps: Vec<PairedApp>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct AuthInner {
     apps: Vec<PairedApp>,
     link_open_until: Option<Instant>,
+    /// Apps paired since the link button was last pressed
+    pairings_in_window: u32,
     /// Application id of the current entertainment streamer
     streamer: Option<Uuid>,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for AuthInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthInner")
+            .field("apps", &self.apps)
+            .field("link_open_until", &self.link_open_until)
+            .field("pairings_in_window", &self.pairings_in_window)
+            .field("streamer", &self.streamer.map(|id| redact(&id.to_string())))
+            .finish()
+    }
+}
+
 pub struct AuthStore {
     mode: AuthMode,
     path: Utf8PathBuf,
     link_duration: Duration,
     inner: RwLock<AuthInner>,
+}
+
+impl fmt::Debug for AuthStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthStore")
+            .field("mode", &self.mode)
+            .field("path", &self.path)
+            .field("link_duration", &self.link_duration)
+            .field("inner", &*self.read())
+            .finish()
+    }
+}
+
+/// Result of one poll of the link button trigger file
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerState {
+    /// No trigger file
+    #[default]
+    Absent,
+    /// A regular file was deleted, and the pairing window opened
+    Pressed,
+    /// A symlink was deleted, the pairing window stays closed
+    SymlinkRemoved,
+    /// Something that is not a regular file (a directory, ...): ignored
+    NotAFile,
+    /// The trigger could not be checked or deleted: ignored
+    Failed,
 }
 
 impl AuthStore {
@@ -189,6 +248,13 @@ impl AuthStore {
         drop(fd);
 
         fs::rename(&tmp, path)?;
+
+        // Make the rename itself durable
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_str().is_empty())
+            .unwrap_or_else(|| Utf8Path::new("."));
+        File::open(dir)?.sync_all()?;
         Ok(())
     }
 
@@ -220,7 +286,9 @@ impl AuthStore {
     }
 
     pub fn open_link_button_for(&self, duration: Duration) {
-        self.write().link_open_until = Some(Instant::now() + duration);
+        let mut lock = self.write();
+        lock.link_open_until = Some(Instant::now() + duration);
+        lock.pairings_in_window = 0;
     }
 
     #[must_use]
@@ -230,14 +298,20 @@ impl AuthStore {
             .is_some_and(|until| Instant::now() < until)
     }
 
-    /// Pair a new app, if the link button window is open. Returns `None` if
-    /// the window is closed.
+    /// Pair a new app, if the link button window is open and has room for
+    /// another app. Returns `None` otherwise.
     pub fn pair(&self, devicetype: &str) -> ApiResult<Option<PairedApp>> {
         let mut lock = self.write();
         if lock
             .link_open_until
             .is_none_or(|until| Instant::now() >= until)
         {
+            return Ok(None);
+        }
+        if lock.pairings_in_window >= MAX_PAIRINGS_PER_WINDOW {
+            log::warn!(
+                "Refused pairing of [{devicetype}]: {MAX_PAIRINGS_PER_WINDOW} apps already paired since the link button was pressed"
+            );
             return Ok(None);
         }
 
@@ -248,6 +322,7 @@ impl AuthStore {
         // Persist before the app becomes valid, so a failed write pairs nothing
         Self::save(&self.path, &apps)?;
         lock.apps = apps;
+        lock.pairings_in_window += 1;
         drop(lock);
 
         log::info!(
@@ -303,8 +378,81 @@ impl AuthStore {
     }
 }
 
-/// Poll for the link button trigger file, about once per second. When it
-/// appears, delete it and open the pairing window.
+impl AuthStore {
+    /// Check the link button trigger file once. Only the successful delete of
+    /// a regular file opens the pairing window: a symlink is deleted but does
+    /// not open it, and anything else is ignored. This way a trigger that
+    /// cannot be deleted (a directory, a read-only mount) cannot keep pairing
+    /// open.
+    pub fn poll_trigger(&self, trigger_file: &Utf8Path) -> (TriggerState, Option<std::io::Error>) {
+        let meta = match fs::symlink_metadata(trigger_file) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (TriggerState::Absent, None);
+            }
+            Err(err) => return (TriggerState::Failed, Some(err)),
+        };
+
+        let file_type = meta.file_type();
+        if !file_type.is_file() && !file_type.is_symlink() {
+            return (TriggerState::NotAFile, None);
+        }
+
+        // remove_file() deletes a symlink itself, never its target
+        if let Err(err) = fs::remove_file(trigger_file) {
+            return (TriggerState::Failed, Some(err));
+        }
+
+        if file_type.is_symlink() {
+            return (TriggerState::SymlinkRemoved, None);
+        }
+
+        self.press_link_button();
+        (TriggerState::Pressed, None)
+    }
+}
+
+/// Log the result of a trigger poll. Each press is logged. A problem is
+/// logged once, when the state changes, not on every poll. Returns true if
+/// something was logged.
+#[must_use]
+pub fn log_trigger_state(
+    trigger_file: &Utf8Path,
+    previous: TriggerState,
+    state: TriggerState,
+    err: Option<&std::io::Error>,
+    link_duration: Duration,
+) -> bool {
+    let err = err.map(|err| format!(": {err}")).unwrap_or_default();
+    match state {
+        TriggerState::Pressed => {
+            log::info!(
+                "link button pressed, pairing open for {} s",
+                link_duration.as_secs()
+            );
+        }
+        _ if state == previous => return false,
+        TriggerState::Absent => return false,
+        TriggerState::SymlinkRemoved => {
+            log::warn!(
+                "Link button trigger [{trigger_file}] is a symlink: deleted it, pairing stays closed"
+            );
+        }
+        TriggerState::NotAFile => {
+            log::warn!(
+                "Link button trigger [{trigger_file}] is not a regular file: ignored, pairing stays closed"
+            );
+        }
+        TriggerState::Failed => {
+            log::warn!(
+                "Cannot check or delete link button trigger [{trigger_file}]{err}: pairing stays closed"
+            );
+        }
+    }
+    true
+}
+
+/// Poll for the link button trigger file, about once per second
 pub async fn link_button_watcher(
     store: std::sync::Arc<AuthStore>,
     trigger_file: Utf8PathBuf,
@@ -312,22 +460,19 @@ pub async fn link_button_watcher(
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut previous = TriggerState::Absent;
     loop {
         interval.tick().await;
 
-        if !trigger_file.exists() {
-            continue;
-        }
-
-        if let Err(err) = fs::remove_file(&trigger_file) {
-            log::error!("Cannot delete link button trigger file [{trigger_file}]: {err}");
-        }
-
-        store.press_link_button();
-        log::info!(
-            "link button pressed, pairing open for {} s",
-            store.link_duration().as_secs()
+        let (state, err) = store.poll_trigger(&trigger_file);
+        let _logged = log_trigger_state(
+            &trigger_file,
+            previous,
+            state,
+            err.as_ref(),
+            store.link_duration(),
         );
+        previous = state;
     }
 }
 
@@ -457,6 +602,118 @@ mod tests {
 
         store.set_streamer(None);
         assert!(store.psk_for_identity(id1.as_bytes()).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regular_trigger_file_opens_once() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        let trigger = dir.join("linkbutton");
+        fs::write(&trigger, b"").unwrap();
+
+        assert_eq!(store.poll_trigger(&trigger).0, TriggerState::Pressed);
+        assert!(store.link_button_open());
+        assert!(!trigger.exists());
+
+        store.open_link_button_for(Duration::ZERO);
+        assert_eq!(store.poll_trigger(&trigger).0, TriggerState::Absent);
+        assert!(!store.link_button_open());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_trigger_never_opens_and_logs_once() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        let trigger = dir.join("linkbutton");
+        fs::create_dir(&trigger).unwrap();
+
+        let mut previous = TriggerState::Absent;
+        let mut logged = 0;
+        for _ in 0..5 {
+            let (state, err) = store.poll_trigger(&trigger);
+            assert_eq!(state, TriggerState::NotAFile);
+            if log_trigger_state(&trigger, previous, state, err.as_ref(), Duration::ZERO) {
+                logged += 1;
+            }
+            previous = state;
+        }
+        assert_eq!(logged, 1);
+        assert!(!store.link_button_open());
+        assert!(trigger.is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn symlink_trigger_is_deleted_but_does_not_open() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        let target = dir.join("target");
+        let trigger = dir.join("linkbutton");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &trigger).unwrap();
+
+        assert_eq!(store.poll_trigger(&trigger).0, TriggerState::SymlinkRemoved);
+        assert!(!store.link_button_open());
+        assert!(fs::symlink_metadata(&trigger).is_err());
+        assert!(target.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn undeletable_trigger_does_not_open() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        let sub = dir.join("ro");
+        fs::create_dir(&sub).unwrap();
+        let trigger = sub.join("linkbutton");
+        fs::write(&trigger, b"").unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+
+        // root ignores directory permissions: nothing to test then
+        let writable = fs::write(sub.join("probe"), b"").is_ok();
+        if !writable {
+            let (state, err) = store.poll_trigger(&trigger);
+            assert_eq!(state, TriggerState::Failed);
+            assert!(err.is_some());
+            assert!(!store.link_button_open());
+            assert!(trigger.exists());
+        }
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pairings_are_capped_per_window() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        store.press_link_button();
+        for _ in 0..MAX_PAIRINGS_PER_WINDOW {
+            assert!(store.pair("app").unwrap().is_some());
+        }
+        assert!(store.pair("one too many").unwrap().is_none());
+
+        store.press_link_button();
+        assert!(store.pair("next window").unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn debug_output_hides_secrets() {
+        let dir = tempdir();
+        let store = strict_store(&dir);
+        store.press_link_button();
+        let app = store.pair("app").unwrap().unwrap();
+        store.set_streamer(Some(app.application_id));
+
+        for text in [format!("{app:?}"), format!("{store:?}")] {
+            assert!(!text.contains(&app.username), "{text}");
+            assert!(!text.contains(&app.application_id.to_string()), "{text}");
+            assert!(!text.contains(&app.clientkey), "{text}");
+            assert!(text.contains(&redact(&app.username)), "{text}");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
