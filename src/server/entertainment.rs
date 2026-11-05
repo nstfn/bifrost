@@ -38,6 +38,8 @@ use crate::routes::auth::STANDARD_CLIENT_KEY;
 use crate::routes::clip::entertainment_configuration::active_area;
 use crate::server::auth_store::{AuthStore, redact};
 
+type BroadcastReceiver = tokio::sync::broadcast::Receiver<Arc<BackendRequest>>;
+
 struct EntertainmentSocket {
     res: Arc<Mutex<Resources>>,
     backend_updates: Sender<Arc<BackendRequest>>,
@@ -216,6 +218,10 @@ impl EntertainmentSocket {
         // this means we discard the first frame, but since we expect at least
         // 10 frames *per second*, this is acceptable.
         let mut sz = Self::read_frame(&mut sess, &mut buf).await?;
+        if sz == 0 {
+            log::info!("Entertainment stream closed by client before the first frame");
+            return Ok(());
+        }
         log::trace!("First entertainment frame: {}", hex::encode(&buf[..sz]));
         let raw = HueStreamPacket::parse(&buf[..sz])?;
 
@@ -230,6 +236,9 @@ impl EntertainmentSocket {
 
         let mut fps = 0;
         let mut period = Utc::now().timestamp();
+
+        // backend requests, to notice when the area stops between frames
+        let mut events = self.backend_updates.subscribe();
 
         loop {
             let view = &buf[..sz];
@@ -266,13 +275,45 @@ impl EntertainmentSocket {
             let req = BackendRequest::EntertainmentFrame(pkt.lights);
             self.backend_updates.send(Arc::new(req)).ok();
 
-            sz = Self::read_frame(&mut sess, &mut buf).await?;
+            // A client can stop the area over CLIP and leave the DTLS session
+            // open. End the session at once, instead of waiting for the read
+            // timeout, so it never lingers next to a new session.
+            tokio::select! {
+                res = Self::read_frame(&mut sess, &mut buf) => sz = res?,
+                () = self.area_stopped(header.area, &mut events) => {
+                    log::info!("Entertainment area {} stopped, closing stream", header.area);
+                    timeout(Duration::from_secs(1), sess.shutdown()).await.ok();
+                    break;
+                }
+            }
+
             if sz == 0 {
+                log::info!("Entertainment stream closed by client");
                 break;
             }
         }
 
         Ok(())
+    }
+
+    /// Resolve when `area` is no longer the streaming area. Checked on each
+    /// entertainment stop request, and when this receiver lagged behind
+    /// (it may have missed one).
+    async fn area_stopped(&self, area: Uuid, events: &mut BroadcastReceiver) {
+        use tokio::sync::broadcast::error::RecvError;
+
+        loop {
+            match events.recv().await {
+                Ok(req) if matches!(*req, BackendRequest::EntertainmentStop()) => {}
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return std::future::pending().await,
+            }
+
+            if active_area(&*self.res.lock().await) != Some(area) {
+                return;
+            }
+        }
     }
 }
 
@@ -490,5 +531,101 @@ impl Service for EntertainmentWatcherService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bifrost_api::backend::BackendRequest;
+    use hue::api::{EntertainmentConfiguration, RType, Resource, ResourceLink};
+    use hue::stream::HueStreamLightsV2;
+    use hue::version::SwVersion;
+    use serde_json::json;
+    use tokio::sync::Mutex;
+    use tokio::sync::broadcast::Sender;
+    use tokio::time::timeout;
+    use uuid::Uuid;
+
+    use crate::model::state::State;
+    use crate::resource::Resources;
+    use crate::server::entertainment::EntertainmentSocket;
+
+    /// A socket for a streaming area, with the backend request channel
+    fn streaming_area() -> (EntertainmentSocket, Sender<Arc<BackendRequest>>, Uuid) {
+        let mut res = Resources::new(SwVersion::default(), State::new());
+        let area = ResourceLink::new(Uuid::new_v4(), RType::EntertainmentConfiguration);
+        let node = ResourceLink::new(Uuid::new_v4(), RType::Entertainment);
+        let ec: EntertainmentConfiguration = serde_json::from_value(json!({
+            "name": "TV",
+            "configuration_type": "screen",
+            "metadata": { "name": "TV" },
+            "status": "active",
+            "stream_proxy": { "mode": "auto", "node": node },
+            "locations": { "service_locations": [] },
+            "light_services": [],
+            "channels": [],
+        }))
+        .unwrap();
+        res.add(&area, Resource::EntertainmentConfiguration(ec))
+            .unwrap();
+
+        let updates = Sender::new(32);
+        let socket = EntertainmentSocket::new(Arc::new(Mutex::new(res)), updates.clone());
+        (socket, updates, area.rid)
+    }
+
+    async fn stop_area(socket: &EntertainmentSocket, area: Uuid) {
+        let mut lock = socket.res.lock().await;
+        lock.update(&area, EntertainmentConfiguration::stop_streaming)
+            .unwrap();
+    }
+
+    fn send(updates: &Sender<Arc<BackendRequest>>, req: BackendRequest) {
+        updates.send(Arc::new(req)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_ends_when_its_area_stops() {
+        let (socket, updates, area) = streaming_area();
+        let mut events = updates.subscribe();
+        let stopped = socket.area_stopped(area, &mut events);
+        tokio::pin!(stopped);
+
+        // frames, or a stop while the area still streams, keep the session open
+        send(
+            &updates,
+            BackendRequest::EntertainmentFrame(HueStreamLightsV2::Rgb(vec![])),
+        );
+        send(&updates, BackendRequest::EntertainmentStop());
+        let wait = Duration::from_millis(50);
+        assert!(timeout(wait, &mut stopped).await.is_err());
+
+        stop_area(&socket, area).await;
+        send(&updates, BackendRequest::EntertainmentStop());
+        timeout(wait, stopped).await.expect("session must end");
+    }
+
+    #[tokio::test]
+    async fn session_checks_its_area_after_missed_requests() {
+        let (socket, updates, area) = streaming_area();
+        let mut events = updates.subscribe();
+        stop_area(&socket, area).await;
+
+        // more frames than the channel holds: the stop request is lost
+        send(&updates, BackendRequest::EntertainmentStop());
+        for _ in 0..40 {
+            send(
+                &updates,
+                BackendRequest::EntertainmentFrame(HueStreamLightsV2::Rgb(vec![])),
+            );
+        }
+
+        let stopped = socket.area_stopped(area, &mut events);
+        timeout(Duration::from_millis(50), stopped)
+            .await
+            .expect("session must end");
     }
 }
