@@ -103,6 +103,10 @@ pub enum HueApiV1Error {
     #[error("Portal connection is required")]
     PortalConnectionIsRequired = 12,
 
+    /// Type 101
+    #[error("link button not pressed")]
+    LinkButtonNotPressed = 101,
+
     /// Type 901
     #[error("Internal bridge error")]
     BridgeInternalError = 901,

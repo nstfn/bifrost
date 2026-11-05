@@ -22,6 +22,7 @@ use serde_json::Value;
 use tokio::time::timeout;
 
 use crate::error::{ApiError, ApiResult};
+use crate::routes::auth::{MaybeCaller, streamer_id};
 use crate::routes::extractor::Json;
 use crate::server::appstate::AppState;
 
@@ -145,6 +146,7 @@ pub async fn get_resource_id(
 async fn put_resource_id(
     State(state): State<AppState>,
     Path(rlink): Path<ResourceLink>,
+    MaybeCaller(caller): MaybeCaller,
     Json(put): Json<Value>,
 ) -> ApiV2Result {
     log::info!("PUT {rlink:?}");
@@ -153,7 +155,10 @@ async fn put_resource_id(
     match rlink.rtype {
         /* Allowed + supported */
         RType::Device => device::put_device(&state, rlink, put).await,
-        RType::EntertainmentConfiguration => ent_conf::put_resource_id(&state, rlink, put).await,
+        RType::EntertainmentConfiguration => {
+            let streamer = streamer_id(caller.as_ref());
+            ent_conf::put_resource_id(&state, rlink, put, streamer).await
+        }
         RType::GroupedLight => grouped_light::put_grouped_light(&state, rlink, put).await,
         RType::Light => light::put_light(&state, rlink, put).await,
         RType::Scene => scene::put_scene(&state, rlink, put).await,

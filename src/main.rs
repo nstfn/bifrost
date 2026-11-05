@@ -106,6 +106,15 @@ async fn build_tasks(
     );
     mgr.register_function("config-writer", svc).await?;
 
+    // register virtual link button (strict auth mode only)
+    if appstate.auth().is_strict() {
+        let svc = server::auth_store::link_button_watcher(
+            appstate.auth().clone(),
+            appstate.config().auth.trigger_file.clone(),
+        );
+        mgr.register_function("link-button", svc).await?;
+    }
+
     // register version updater
     let svc = server::version_updater(appstate.res.clone(), appstate.updater());
     mgr.register_function("version-updater", svc).await?;
@@ -126,6 +135,7 @@ async fn build_tasks(
         bconf.entm_cookie_exchange,
         appstate.res.clone(),
         appstate.backend.clone(),
+        appstate.auth().clone(),
     )?;
     mgr.register_service("entertainment", svc).await?;
     let svc = server::entertainment::EntertainmentWatcherService::new(appstate.res.clone());

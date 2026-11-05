@@ -15,6 +15,7 @@ use crate::config::AppConfig;
 use crate::error::ApiResult;
 use crate::model::state::{State, StateVersion};
 use crate::resource::Resources;
+use crate::server::auth_store::AuthStore;
 use crate::server::behavior_instance::BehaviorTriggerRequest;
 use crate::server::certificate;
 use crate::server::updater::VersionUpdater;
@@ -43,6 +44,7 @@ pub struct AppState {
     pub res: Arc<Mutex<Resources>>,
     pub backend: Sender<Arc<BackendRequest>>,
     behavior_instance_client: BehaviorInstanceClient,
+    auth: Arc<AuthStore>,
 }
 
 impl AppState {
@@ -99,6 +101,8 @@ impl AppState {
 
         res.reset_all_streaming()?;
 
+        let auth = Arc::new(AuthStore::from_config(&config)?);
+
         let conf = Arc::new(config);
         let backend = res.backend_sender();
         let res = Arc::new(Mutex::new(res));
@@ -110,6 +114,7 @@ impl AppState {
             res,
             backend,
             behavior_instance_client: BehaviorInstanceClient::new(behavior_trigger),
+            auth,
         })
     }
 
@@ -126,6 +131,11 @@ impl AppState {
     #[must_use]
     pub fn manager(&self) -> SvmClient {
         self.svm.clone()
+    }
+
+    #[must_use]
+    pub const fn auth(&self) -> &Arc<AuthStore> {
+        &self.auth
     }
 
     #[must_use]

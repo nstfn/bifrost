@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
-use axum::Router;
 use axum::extract::{Path, State};
 use axum::routing::{get, post, put};
+use axum::{Router, middleware};
 use bytes::Bytes;
 use chrono::Utc;
 use hue::devicedb::gradient_product_data;
@@ -10,6 +10,7 @@ use log::{info, warn};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::MutexGuard;
+use uuid::Uuid;
 
 use bifrost_api::backend::BackendRequest;
 use hue::api::{
@@ -30,19 +31,40 @@ use hue::legacy_api::{
 
 use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
-use crate::routes::auth::{STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY};
+use crate::routes::auth::{
+    MaybeCaller, STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY, require_v1_user, streamer_id,
+};
 use crate::routes::clip::entertainment_configuration;
 use crate::routes::extractor::Json;
 use crate::routes::{ApiV1Error, ApiV1Result};
 use crate::server::appstate::AppState;
+use crate::server::auth_store::{AuthStore, redact};
 
 async fn get_api_config(State(state): State<AppState>) -> Json<impl Serialize> {
     Json(state.api_short_config().await)
 }
 
-async fn post_api(bytes: Bytes) -> ApiV1Result<Json<impl Serialize>> {
+async fn post_api(
+    State(state): State<AppState>,
+    bytes: Bytes,
+) -> ApiV1Result<Json<impl Serialize>> {
     info!("post: {bytes:?}");
     let json: NewUser = serde_json::from_slice(&bytes)?;
+
+    let auth = state.auth();
+    if auth.is_strict() {
+        let Some(app) = auth.pair(&json.devicetype)? else {
+            Err(HueApiV1Error::LinkButtonNotPressed)?
+        };
+
+        let res = NewUserReply {
+            clientkey: json
+                .generateclientkey
+                .then(|| app.clientkey.to_ascii_uppercase()),
+            username: app.username,
+        };
+        return Ok(Json(vec![HueApiResult::Success(res)]));
+    }
 
     let res = NewUserReply {
         clientkey: if json.generateclientkey {
@@ -70,7 +92,21 @@ fn get_lights(res: &MutexGuard<Resources>) -> ApiResult<HashMap<String, ApiLight
     Ok(lights)
 }
 
-fn get_groups(res: &MutexGuard<Resources>, group_0: bool) -> ApiResult<HashMap<String, ApiGroup>> {
+/// v1 stream owner: the username of the streaming app in strict mode, the
+/// standard id in open mode
+fn stream_owner(auth: &AuthStore, streamer: Uuid) -> String {
+    if !auth.is_strict() {
+        return STANDARD_APPLICATION_ID.to_string();
+    }
+    auth.find_by_id(streamer)
+        .map_or_else(|| streamer.to_string(), |app| app.username)
+}
+
+fn get_groups(
+    res: &MutexGuard<Resources>,
+    auth: &AuthStore,
+    group_0: bool,
+) -> ApiResult<HashMap<String, ApiGroup>> {
     let mut rooms = HashMap::new();
 
     if group_0 {
@@ -166,7 +202,7 @@ fn get_groups(res: &MutexGuard<Resources>, group_0: bool) -> ApiResult<HashMap<S
                 state: ApiGroupState::default(),
                 stream: json!({
                     "active": entconf.active_streamer.is_some(),
-                    "owner": entconf.active_streamer.map(|_st| STANDARD_APPLICATION_ID.to_string()),
+                    "owner": entconf.active_streamer.map(|st| stream_owner(auth, st.rid)),
                     "proxymode": "auto",
                     "proxynode": "/bridge"
                 }),
@@ -242,7 +278,7 @@ async fn get_api_user(
 
     Ok(Json(ApiUserConfig {
         config: state.api_config(username.clone()).await?,
-        groups: get_groups(&lock, false)?,
+        groups: get_groups(&lock, state.auth(), false)?,
         lights: get_lights(&lock)?,
         resourcelinks: HashMap::new(),
         rules: HashMap::new(),
@@ -260,7 +296,7 @@ async fn get_api_user_resource(
     match artype {
         ApiResourceType::Config => Ok(Json(json!(state.api_config(username).await?))),
         ApiResourceType::Lights => Ok(Json(json!(get_lights(lock)?))),
-        ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, false)?))),
+        ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, state.auth(), false)?))),
         ApiResourceType::Scenes => Ok(Json(json!(get_scenes(&username, lock)?))),
         ApiResourceType::Resourcelinks
         | ApiResourceType::Rules
@@ -371,7 +407,10 @@ async fn get_api_user_resource_id(
     State(state): State<AppState>,
     Path((username, resource, id)): Path<(String, ApiResourceType, u32)>,
 ) -> ApiV1Result<Json<impl Serialize>> {
-    log::debug!("GET v1 username={username} resource={resource:?} id={id}");
+    log::debug!(
+        "GET v1 username={} resource={resource:?} id={id}",
+        redact(&username)
+    );
     let result = match resource {
         ApiResourceType::Lights => {
             let lock = state.res.lock().await;
@@ -392,7 +431,7 @@ async fn get_api_user_resource_id(
         }
         ApiResourceType::Groups => {
             let lock = state.res.lock().await;
-            let groups = get_groups(&lock, true)?;
+            let groups = get_groups(&lock, state.auth(), true)?;
             let group = groups
                 .get(&id.to_string())
                 .ok_or(HueError::V1NotFound(id))?;
@@ -409,9 +448,13 @@ async fn get_api_user_resource_id(
 async fn put_api_user_resource_id(
     State(state): State<AppState>,
     Path((username, artype, id)): Path<(String, ApiResourceType, u32)>,
+    MaybeCaller(caller): MaybeCaller,
     Json(req): Json<Value>,
 ) -> ApiV1Result<Json<Value>> {
-    log::debug!("PUT v1 username={username} resource={artype:?} id={id}");
+    log::debug!(
+        "PUT v1 username={} resource={artype:?} id={id}",
+        redact(&username)
+    );
     log::debug!("JSON: {req:?}");
     match artype {
         ApiResourceType::Groups => {
@@ -445,6 +488,7 @@ async fn put_api_user_resource_id(
                 &state,
                 rlink,
                 serde_json::to_value(&ecupd)?,
+                streamer_id(caller.as_ref()),
             )
             .await?;
 
@@ -598,12 +642,9 @@ pub async fn workaround_iconnect_hue() -> ApiV1Result<()> {
     Err(HueApiV1Error::UnauthorizedUser)?
 }
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/", post(post_api))
-        .route("/config", get(get_api_config))
-        .route("/nouser/config", get(get_api_config))
-        .route("/newUser", get(workaround_iconnect_hue))
+pub fn router(appstate: &AppState) -> Router<AppState> {
+    // In strict auth mode, every /api/{user}/... route requires a paired user
+    let user_routes = Router::new()
         .route("/{user}", get(get_api_user))
         .route("/{user}/{rtype}", get(get_api_user_resource))
         .route("/{user}/{rtype}", post(post_api_user_resource))
@@ -614,4 +655,15 @@ pub fn router() -> Router<AppState> {
             "/{user}/{rtype}/{id}/{key}",
             put(put_api_user_resource_id_path),
         )
+        .route_layer(middleware::from_fn_with_state(
+            appstate.clone(),
+            require_v1_user,
+        ));
+
+    Router::new()
+        .route("/", post(post_api))
+        .route("/config", get(get_api_config))
+        .route("/nouser/config", get(get_api_config))
+        .route("/newUser", get(workaround_iconnect_hue))
+        .merge(user_routes)
 }

@@ -2,7 +2,7 @@ use bifrost_api::backend::BackendRequest;
 use hue::devicedb::gradient_product_data;
 use hue::error::HueError;
 use serde_json::Value;
-use uuid::{Uuid, uuid};
+use uuid::Uuid;
 
 use hue::api::{
     Bridge, Device, Entertainment, EntertainmentConfiguration, EntertainmentConfigurationAction,
@@ -16,7 +16,6 @@ use hue::api::{
 
 use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
-use crate::routes::auth::STANDARD_APPLICATION_ID;
 use crate::routes::clip::{ApiV2Result, V2Reply};
 use crate::server::appstate::AppState;
 
@@ -180,7 +179,14 @@ pub fn active_area(res: &Resources) -> Option<Uuid> {
         })
 }
 
-pub async fn put_resource_id(state: &AppState, rlink: ResourceLink, put: Value) -> ApiV2Result {
+/// Update an entertainment configuration. On `start`, `streamer` (the
+/// application id of the caller) becomes the active streamer.
+pub async fn put_resource_id(
+    state: &AppState,
+    rlink: ResourceLink,
+    put: Value,
+    streamer: Uuid,
+) -> ApiV2Result {
     let upd: EntertainmentConfigurationUpdate = serde_json::from_value(put)?;
 
     let mut lock = state.res.lock().await;
@@ -265,8 +271,7 @@ pub async fn put_resource_id(state: &AppState, rlink: ResourceLink, put: Value) 
         if let Some(action) = &action {
             match action {
                 EntertainmentConfigurationAction::Start => {
-                    ec.active_streamer =
-                        Some(RType::AuthV1.link_to(uuid!(STANDARD_APPLICATION_ID)));
+                    ec.active_streamer = Some(RType::AuthV1.link_to(streamer));
                     ec.status = EntertainmentConfigurationStatus::Active;
                 }
                 EntertainmentConfigurationAction::Stop => {
@@ -276,6 +281,13 @@ pub async fn put_resource_id(state: &AppState, rlink: ResourceLink, put: Value) 
             }
         }
     })?;
+
+    // The DTLS PSK callback cannot lock the resources, so it reads the
+    // current streamer from the auth store
+    let current_streamer = active_area(&lock)
+        .and_then(|id| lock.get_id::<EntertainmentConfiguration>(id).ok())
+        .and_then(|ec| ec.active_streamer.map(|st| st.rid));
+    state.auth().set_streamer(current_streamer);
 
     match action {
         Some(EntertainmentConfigurationAction::Start) => {

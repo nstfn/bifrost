@@ -36,6 +36,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
 use crate::routes::auth::STANDARD_CLIENT_KEY;
 use crate::routes::clip::entertainment_configuration::active_area;
+use crate::server::auth_store::{AuthStore, redact};
 
 struct EntertainmentSocket {
     res: Arc<Mutex<Resources>>,
@@ -282,6 +283,7 @@ pub struct EntertainmentService {
     ctx: Option<SslContext>,
     res: Arc<Mutex<Resources>>,
     backend_updates: Sender<Arc<BackendRequest>>,
+    auth: Arc<AuthStore>,
 }
 
 impl EntertainmentService {
@@ -291,6 +293,7 @@ impl EntertainmentService {
         cookie_exchange: bool,
         res: Arc<Mutex<Resources>>,
         backend_updates: Sender<Arc<BackendRequest>>,
+        auth: Arc<AuthStore>,
     ) -> ApiResult<Self> {
         let res = Self {
             addr: SocketAddr::new(addr.into(), port),
@@ -299,6 +302,7 @@ impl EntertainmentService {
             ctx: None,
             res,
             backend_updates,
+            auth,
         };
 
         Ok(res)
@@ -312,13 +316,33 @@ impl Service for EntertainmentService {
     async fn configure(&mut self) -> Result<(), Self::Error> {
         let mut bldr = SslContext::builder(SslMethod::dtls_server())?;
 
-        bldr.set_psk_server_callback(|_sslref, cid, psk| {
-            let client_id = String::from_utf8_lossy(cid.unwrap_or_default());
-            log::debug!("Setting PSK for {client_id}",);
-            STANDARD_CLIENT_KEY.write_to_slice(psk).unwrap();
+        // This callback runs synchronously inside the DTLS handshake, so it
+        // reads the auth store snapshot (a std lock), never the tokio mutex.
+        let auth = self.auth.clone();
+        bldr.set_psk_server_callback(move |_sslref, cid, psk| {
+            let identity = cid.unwrap_or_default();
 
-            log::trace!("psk: {}", hex::encode(&psk[..16]));
-            Ok(16)
+            if !auth.is_strict() {
+                let client_id = String::from_utf8_lossy(identity);
+                log::debug!("Setting PSK for {client_id}");
+                STANDARD_CLIENT_KEY.write_to_slice(psk).unwrap();
+                return Ok(16);
+            }
+
+            let client_id = redact(&String::from_utf8_lossy(identity));
+            match auth.psk_for_identity(identity) {
+                Some(key) if key.write_to_slice(psk).is_ok() => {
+                    log::debug!("Setting PSK for {client_id}");
+                    Ok(16)
+                }
+                _ => {
+                    log::warn!(
+                        "Rejected entertainment stream: identity {client_id} is not the active streamer"
+                    );
+                    // A zero-length PSK makes OpenSSL fail the handshake
+                    Ok(0)
+                }
+            }
         });
 
         if self.cookie_exchange {

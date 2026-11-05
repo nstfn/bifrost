@@ -2,6 +2,7 @@
 pub mod banner;
 
 pub mod appstate;
+pub mod auth_store;
 pub mod behavior_instance;
 pub mod certificate;
 pub mod entertainment;
@@ -20,6 +21,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::extract::{ConnectInfo, Request};
+use axum::http::Uri;
 use axum::response::Response;
 use axum::{Router, ServiceExt};
 
@@ -37,6 +39,7 @@ use crate::error::ApiResult;
 use crate::resource::Resources;
 use crate::routes;
 use crate::server::appstate::AppState;
+use crate::server::auth_store::redact;
 use crate::server::updater::VersionUpdater;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,11 +48,49 @@ pub enum Protocol {
     Https,
 }
 
-fn trace_layer_make_span_with(request: &Request, protocol: Protocol) -> Span {
+/// Shorten the v1 username in a `/api/{user}/...` uri, so the request log
+/// does not show a full key (strict auth mode)
+fn redact_v1_uri(uri: &Uri) -> String {
+    let full = uri.to_string();
+    let Some(rest) = uri.path().strip_prefix("/api/") else {
+        return full;
+    };
+    let user = rest.split('/').next().unwrap_or_default();
+    if user.len() <= 4 || matches!(user, "config" | "nouser" | "newUser") {
+        return full;
+    }
+    full.replacen(
+        &format!("/api/{user}"),
+        &format!("/api/{}", redact(user)),
+        1,
+    )
+}
+
+fn trace_layer_make_span_with(request: &Request, protocol: Protocol, strict: bool) -> Span {
     let addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |ci| ci.0.ip());
+
+    if strict {
+        let uri = redact_v1_uri(request.uri());
+        return match protocol {
+            Protocol::Https => info_span!(
+                "https",
+                client = ?addr,
+                method = ?request.method(),
+                uri = %uri,
+                status = tracing::field::Empty,
+            ),
+            Protocol::Http => info_span!(
+                "http",
+                client = ?addr,
+                method = ?request.method(),
+                uri = %uri,
+                status = tracing::field::Empty,
+            ),
+        };
+    }
 
     match protocol {
         Protocol::Https => info_span!(
@@ -78,9 +119,12 @@ fn trace_layer_on_response(response: &Response<Body>, latency: Duration, span: &
 }
 
 fn router(protocol: Protocol, appstate: AppState) -> Router<()> {
+    let strict = appstate.auth().is_strict();
     routes::router(appstate).layer(
         TraceLayer::new_for_http()
-            .make_span_with(move |request: &Request| trace_layer_make_span_with(request, protocol))
+            .make_span_with(move |request: &Request| {
+                trace_layer_make_span_with(request, protocol, strict)
+            })
             .on_response(trace_layer_on_response),
     )
 }
