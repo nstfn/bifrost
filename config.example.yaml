@@ -2,6 +2,12 @@ bifrost:
   # Override the default path to the one used in the docker image
   cert_file: "certs/cert.pem"
 
+# Uncomment to require pairing with a virtual link button (see doc/config-reference.md)
+# auth:
+#   mode: strict
+#   link_button_seconds: 120
+#   trigger_file: linkbutton
+
 bridge:
   name: Bifrost
   mac: 00:11:22:33:44:55

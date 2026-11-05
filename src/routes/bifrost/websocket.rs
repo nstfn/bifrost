@@ -89,7 +89,8 @@ impl WebSocketTask {
         let mut svc_events = self.mgr.subscribe().await?.1;
 
         let app_config = self.state.config();
-        self.send(Update::AppConfig((*app_config).clone())).await?;
+        self.send(Update::AppConfig(Box::new((*app_config).clone())))
+            .await?;
 
         self.send(Update::HueEvent(EventBlock::add(hue_state)))
             .await?;

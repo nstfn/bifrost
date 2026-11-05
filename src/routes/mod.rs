@@ -1,6 +1,6 @@
-use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::response::{IntoResponse, Response};
+use axum::{Router, middleware};
 use hue::error::{HueApiV1Error, HueError};
 use hue::legacy_api::ApiResourceType;
 use hyper::StatusCode;
@@ -59,7 +59,8 @@ impl ApiV1Error {
                 | HueApiV1Error::InvalidValueForParameter
                 | HueApiV1Error::ParameterNotModifiable
                 | HueApiV1Error::TooManyItemsInList
-                | HueApiV1Error::PortalConnectionIsRequired,
+                | HueApiV1Error::PortalConnectionIsRequired
+                | HueApiV1Error::LinkButtonNotPressed,
             ) => StatusCode::OK,
 
             Self::HueApiV1(HueApiV1Error::BridgeInternalError) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -144,6 +145,8 @@ impl IntoResponse for ApiError {
 
             Self::AuxNotFound(_) => StatusCode::NOT_FOUND,
 
+            Self::WrongResourceType(_, _) => StatusCode::BAD_REQUEST,
+
             Self::CreateNotAllowed(_) | Self::UpdateNotAllowed(_) | Self::DeleteNotAllowed(_) => {
                 StatusCode::METHOD_NOT_ALLOWED
             }
@@ -160,15 +163,23 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(appstate: AppState) -> Router<()> {
-    Router::new()
-        .nest("/api", api::router())
+    // In strict auth mode, these routes require a hue-application-key header
+    let protected = Router::new()
         .nest("/auth", auth::router())
         .nest("/updater", updater::router())
-        .nest("/licenses", licenses::router())
-        .nest("/description.xml", upnp::router())
         .nest("/clip/v2/resource", clip::router())
         .nest("/eventstream", eventstream::router())
         .nest("/bifrost", bifrost::router())
+        .route_layer(middleware::from_fn_with_state(
+            appstate.clone(),
+            auth::require_application_key,
+        ));
+
+    Router::new()
+        .nest("/api", api::router(&appstate))
+        .nest("/licenses", licenses::router())
+        .nest("/description.xml", upnp::router())
+        .merge(protected)
         .with_state(appstate)
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
 }
