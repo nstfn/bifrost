@@ -33,6 +33,19 @@ bridge:
   gateway: 10.0.0.1
   timezone: Europe/Copenhagen
 
+  # Address to bind the listeners to [optional!]
+  #
+  # By default, the http, https, entertainment (DTLS) and ssdp listeners bind
+  # to `ipaddress`. That fails when `ipaddress` is not a local address, for
+  # example inside a container without host networking, where the bridge is
+  # reached through published ports.
+  #
+  # Set this to 0.0.0.0 (or the container address) to bind there instead,
+  # while still advertising `ipaddress` in the API, description.xml, ssdp
+  # and mdns. Note that ssdp and mdns discovery will not reach the LAN from
+  # an isolated container network, so clients must be given the ip address.
+  bind_ipaddress: 0.0.0.0
+
   # HTTP port for emulated bridge
   #
   # beware: most client programs do NOT support non-standard ports.
