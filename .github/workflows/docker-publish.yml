@@ -2,7 +2,9 @@ name: Docker
 
 on:
   push:
-    branches: [ "master", "dev" ]
+    # nstfn fork: also publish from the fork's main branch.
+    # Tags become nstfn-main-latest and nstfn-main-YYYY-MM-DD (metadata-action turns "/" into "-").
+    branches: [ "master", "dev", "nstfn/main" ]
     # Publish semver tags as releases.
     tags: [ "v*.*.*", "dev*" ]
 #  pull_request:
