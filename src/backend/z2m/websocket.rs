@@ -11,7 +11,7 @@ use z2m::request::Z2mPayload;
 use z2m::update::DeviceUpdate;
 use z2m::{api::RawMessage, request::Z2mRequest};
 
-use crate::backend::z2m::zclcommand::hue_zclcommand;
+use crate::backend::z2m::zclcommand::{hue_entertainment_zclcommand, hue_zclcommand};
 use crate::error::ApiResult;
 
 pub struct Z2mWebSocket {
@@ -171,7 +171,7 @@ impl Z2mWebSocket {
         topic: &str,
         msg: &ZigbeeMessage,
     ) -> ApiResult<()> {
-        let z2mreq = Z2mRequest::EntertainmentFrame(hue_zclcommand(msg));
+        let z2mreq = Z2mRequest::EntertainmentFrame(hue_entertainment_zclcommand(msg));
         self.send(topic, &z2mreq).await
     }
 
