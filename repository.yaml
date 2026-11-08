@@ -1,0 +1,6 @@
+# Home Assistant app repository: this repo holds both the Bifrost code and its
+# app (bifrost-nstfn/). Add https://github.com/nstfn/bifrost#nstfn/main to the
+# app store.
+name: Bifrost (nstfn)
+url: https://github.com/nstfn/bifrost
+maintainer: nstfn

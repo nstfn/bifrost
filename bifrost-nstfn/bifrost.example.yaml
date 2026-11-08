@@ -1,0 +1,21 @@
+# Copy to /config/bifrost/config.yaml (seen from the add-on; on HAOS this is
+# the "bifrost" folder next to Home Assistant's configuration.yaml).
+# Reference: https://github.com/nstfn/bifrost/blob/nstfn/main/doc/config-reference.md
+bridge:
+  name: Bifrost
+  # MAC of the HAOS host. Bridge id and TLS certificate derive from it:
+  # changing it means a new certificate (cert.pem) and pairing again.
+  mac: 88:a2:9e:22:a4:bb
+  # Address advertised to clients (API, description.xml): the HAOS host.
+  ipaddress: 10.0.10.48
+  # Bind inside the container: 10.0.10.48 is not a local address there.
+  bind_ipaddress: 0.0.0.0
+  netmask: 255.255.255.0
+  gateway: 10.0.10.1
+  timezone: Europe/Paris
+
+z2m:
+  # Keep this name stable: it is stored with the imported devices and groups.
+  zigbee2mqtt:
+    # Z2M add-on frontend on the hassio network (not published on the LAN).
+    url: ws://45df7312-zigbee2mqtt:8099/api

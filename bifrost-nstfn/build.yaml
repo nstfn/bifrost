@@ -1,0 +1,16 @@
+# https://developers.home-assistant.io/docs/add-ons/configuration#add-on-dockerfile
+#
+# Image published by .github/workflows/docker-publish.yml of this repository on a
+# push to the branch nstfn/main. Tags: nstfn-main-latest and nstfn-main-YYYY-MM-DD.
+# The GHCR package must be public, or the supervisor cannot pull it.
+build_from:
+  # Build of nstfn/bifrost 189d9be, index digest sha256:ff624eaaaa895b4398631974c58ae12f50ee31888b4beeca4ea0474a15d2598b.
+  # The supervisor accepts only image:tag here, not image@sha256 (regex check; it then builds
+  # from its default base image, without Bifrost), and it builds with --pull.
+  # A second push on the same day moves the date tag: compare the digest before a rebuild.
+  aarch64: "ghcr.io/nstfn/bifrost:nstfn-main-2026-11-08"
+labels:
+  org.opencontainers.image.title: "Home Assistant Add-on: Bifrost (nstfn)"
+  org.opencontainers.image.description: "Hue bridge emulator backed by Zigbee2MQTT (personal fork, no host network)."
+  org.opencontainers.image.source: "https://github.com/nstfn/bifrost"
+  org.opencontainers.image.licenses: "GNU GPLv3"

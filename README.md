@@ -11,8 +11,8 @@ emulator this work starts from.
 
 ## The setup it targets
 
-- Home Assistant OS on a Raspberry Pi 5, with the app "Bifrost (nstfn)" from
-  [nstfn/bifrost-hassio](https://github.com/nstfn/bifrost-hassio) (no host network).
+- Home Assistant OS on a Raspberry Pi 5, with the app "Bifrost (nstfn)" from this repository
+  ([bifrost-nstfn/](bifrost-nstfn/), no host network).
 - Zigbee2MQTT 2.14.3; Zigbee coordinator on the network (CC2652P over TCP).
 - One entertainment area, one paired app (lg-hue-sync), `auth.mode: strict`,
   `streaming_fps: 15`.
@@ -51,11 +51,12 @@ twenty5schmeckels (LCX002 segment layout), which upstream has merged since.
 
 ## Install
 
-Add the app repository `https://github.com/nstfn/bifrost-hassio#nstfn/main` in Home Assistant
+This repository is also the Home Assistant app repository (`repository.yaml`, app in
+`bifrost-nstfn/`). Add `https://github.com/nstfn/bifrost#nstfn/main` to the app store
 and install "Bifrost (nstfn)". To ship a new build:
 
 1. Push to `nstfn/main`. CI publishes the image with today's date tag.
-2. In `bifrost-hassio`, set that tag in `bifrost-nstfn/build.yaml` and the same version in
+2. Set that tag in `bifrost-nstfn/build.yaml` and the same version in
    `bifrost-nstfn/config.yaml`.
 3. Reload the app store and update the app with a backup.
 
