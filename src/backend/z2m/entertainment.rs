@@ -112,14 +112,22 @@ impl EntStream {
         Ok(())
     }
 
+    /// Send one frame and return its zigbee data bytes.
+    ///
+    /// The data is unique within a stream: its first 4 bytes are the stream
+    /// counter, which [`EntertainmentZigbeeStream::frame`] increments for
+    /// every frame. Flow control matches acks on it.
     pub async fn frame(
         &mut self,
         z2mws: &mut Z2mWebSocket,
         frame: &HueStreamLightsV2,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<Vec<u8>> {
         let blks = self.generate_frame(frame);
 
         let message = self.stream.frame(blks)?;
-        z2mws.send_entertainment_frame(&self.target, &message).await
+        z2mws
+            .send_entertainment_frame(&self.target, &message)
+            .await?;
+        Ok(message.data)
     }
 }

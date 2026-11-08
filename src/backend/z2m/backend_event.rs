@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hue::clamp::Clamp;
 use hue::effect_duration::EffectDuration;
@@ -22,6 +22,7 @@ use z2m::api::DeviceRead;
 use z2m::update::{DeviceEffect, DeviceUpdate};
 
 use crate::backend::z2m::entertainment::EntStream;
+use crate::backend::z2m::flow::{INVOKED_PREFIX, NO_ACK_WARNING};
 use crate::backend::z2m::websocket::Z2mWebSocket;
 use crate::backend::z2m::{Z2mBackend, Z2mMessage};
 use crate::error::ApiResult;
@@ -643,6 +644,7 @@ impl Z2mBackend {
         ent_id: &Uuid,
     ) -> ApiResult<()> {
         log::trace!("[{}] Entertainment start", self.name);
+        self.flow.reset();
         let lock = self.state.lock().await;
 
         let ent: &EntertainmentConfiguration = lock.get_id(*ent_id)?;
@@ -718,10 +720,41 @@ impl Z2mBackend {
         z2mws: &mut Z2mWebSocket,
         frame: &HueStreamLightsV2,
     ) -> ApiResult<()> {
-        if let Some(es) = &mut self.entstream
-            && self.throttle.tick()
-        {
-            es.frame(z2mws, frame).await?;
+        if self.entstream.is_some() {
+            self.flow.set_pending(frame.clone());
+            self.entertainment_flush(z2mws).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send the waiting entertainment frame if flow control and the frame
+    /// rate cap allow it (see [`crate::backend::z2m::flow`]).
+    pub(crate) async fn entertainment_flush(&mut self, z2mws: &mut Z2mWebSocket) -> ApiResult<()> {
+        let Some(es) = &mut self.entstream else {
+            return Ok(());
+        };
+
+        // tick the throttle only when a frame is about to go, so a frame
+        // held back by flow control does not use up a slot of the cap
+        while self.flow.may_send(Instant::now()) && self.throttle.tick() {
+            let Some(frame) = self.flow.take_pending() else {
+                break;
+            };
+            let data = es.frame(z2mws, &frame).await?;
+            self.flow.sent(data, Instant::now());
+        }
+
+        if self.flow.no_ack_warning_due(Instant::now()) {
+            log::warn!(
+                "[{}] Entertainment: no completion ack from zigbee2mqtt for {} s of frames to {}; \
+                 frames are limited to ~1/s. Likely cause: zigbee2mqtt log_level above info, \
+                 or the \"{}\" log text changed.",
+                self.name,
+                NO_ACK_WARNING.as_secs(),
+                es.target,
+                INVOKED_PREFIX,
+            );
         }
 
         Ok(())
@@ -729,6 +762,7 @@ impl Z2mBackend {
 
     async fn backend_entertainment_stop(&mut self, z2mws: &mut Z2mWebSocket) -> ApiResult<()> {
         log::debug!("Stopping entertainment mode..");
+        self.flow.reset();
         if let Some(es) = &mut self.entstream.take() {
             let mut lock = self.state.lock().await;
 

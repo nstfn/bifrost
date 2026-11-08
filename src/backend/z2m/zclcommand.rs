@@ -45,10 +45,17 @@ pub fn hue_zclcommand(msg: &ZigbeeMessage) -> Value {
 /// one interval, and the next frame follows. Reset and segment mapping keep
 /// the recovery (see `zStackAdapter.sendZclFrameToEndpointInternal`,
 /// zigbee-herdsman 11.2.0).
+///
+/// `"logging": true` makes zigbee-herdsman-converters log `Invoked ZCL
+/// command ... with payload '{"data":[...]}'` at info level once the frame
+/// completes. zigbee2mqtt forwards that line on `bridge/logging`, and Bifrost
+/// uses it as the ack that lets the next frame go (see
+/// [`crate::backend::z2m::flow`]).
 #[must_use]
 pub fn hue_entertainment_zclcommand(msg: &ZigbeeMessage) -> Value {
     let mut req = hue_zclcommand(msg);
     req["zclcommand"]["options"]["disableRecovery"] = Value::Bool(true);
+    req["zclcommand"]["logging"] = Value::Bool(true);
     req
 }
 
@@ -79,6 +86,10 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("disableRecovery");
+        frame["zclcommand"]
+            .as_object_mut()
+            .unwrap()
+            .remove("logging");
 
         assert_eq!(frame, hue_zclcommand(&msg));
     }

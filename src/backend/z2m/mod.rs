@@ -3,6 +3,7 @@ mod bridge_event;
 mod bridge_import;
 mod button;
 pub mod entertainment;
+pub mod flow;
 mod group;
 pub mod learn;
 pub mod websocket;
@@ -29,11 +30,13 @@ use tokio_tungstenite::{
 
 use bifrost_api::backend::BackendRequest;
 use hue::api::ResourceLink;
+use hue::stream::HueStreamLightsV2;
 use z2m::api::DeviceRead;
 use z2m::update::DeviceUpdate;
 
 use crate::backend::z2m::button::Z2mButtonHandler;
 use crate::backend::z2m::entertainment::EntStream;
+use crate::backend::z2m::flow::FrameFlow;
 use crate::backend::z2m::learn::SceneLearn;
 use crate::backend::z2m::websocket::Z2mWebSocket;
 use crate::config::{AppConfig, Z2mServer};
@@ -92,6 +95,7 @@ pub struct Z2mBackend {
     counter: u32,
     fps: u32,
     throttle: Throttle,
+    flow: FrameFlow<HueStreamLightsV2>,
     socket: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     button_handlers: HashMap<ResourceLink, Arc<Mutex<Z2mButtonHandler>>>,
 
@@ -134,6 +138,7 @@ impl Z2mBackend {
             network,
             entstream,
             throttle,
+            flow: FrameFlow::new(),
             fps,
             message_rx,
             message_tx,
@@ -149,6 +154,8 @@ impl Z2mBackend {
         mut socket: Z2mWebSocket,
     ) -> ApiResult<()> {
         loop {
+            let wakeup = self.flow.next_wakeup(std::time::Instant::now());
+
             select! {
                 // all backend event handling implemented in backend::z2m::backend_event
                 pkt = chan.recv() => {
@@ -161,6 +168,18 @@ impl Z2mBackend {
                 // all bridge event handling implemented in backend::z2m::bridge_event
                 pkt = socket.next() => {
                     self.handle_bridge_event(pkt.ok_or(ApiError::UnexpectedZ2mEof)??).await?;
+                    // an ack may have freed the way for the waiting frame
+                    self.entertainment_flush(&mut socket).await?;
+                },
+
+                // a frame in flight passed a deadline: the waiting frame may go
+                () = async {
+                    match wakeup {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.entertainment_flush(&mut socket).await?;
                 },
 
                 Some((topic, message)) = self.message_rx.recv() => {

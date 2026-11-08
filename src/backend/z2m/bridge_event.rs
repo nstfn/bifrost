@@ -18,6 +18,7 @@ use z2m::update::DeviceUpdate;
 
 use crate::backend::z2m::Z2mBackend;
 use crate::backend::z2m::button::Z2mButtonHandler;
+use crate::backend::z2m::flow::{self, Ack};
 use crate::error::{ApiError, ApiResult};
 use crate::resource::Resources;
 
@@ -371,6 +372,43 @@ impl Z2mBackend {
         Ok(())
     }
 
+    /// Feed the entertainment flow control with a `bridge/logging` payload
+    /// (`{"level", "message", "namespace"}`) that reports the completion of
+    /// a frame. The caller flushes the waiting frame afterwards.
+    fn entertainment_ack(&mut self, payload: &Value) {
+        let Some(es) = &self.entstream else {
+            return;
+        };
+        let field = |key| payload.get(key).and_then(Value::as_str);
+        let Some(message) = field("message") else {
+            return;
+        };
+
+        let ack = if field("namespace") == Some("zhc:tz")
+            && let Some(data) = flow::parse_invoked(message)
+        {
+            self.flow.ack_data(&data)
+        } else if field("level") == Some("error")
+            && message
+                .strip_prefix("Publish 'set' 'zclcommand' to '")
+                .and_then(|rest| rest.strip_prefix(es.target.as_str()))
+                .is_some_and(|rest| rest.starts_with("' failed"))
+        {
+            log::debug!("[{}] Entertainment frame failed: {message}", self.name);
+            self.flow.ack_failure()
+        } else {
+            return;
+        };
+
+        if ack == (Ack::Matched { first: true }) {
+            log::info!(
+                "[{}] Entertainment: first completion ack from zigbee2mqtt, frames to {} now wait for it",
+                self.name,
+                es.target,
+            );
+        }
+    }
+
     async fn handle_bridge_message(&mut self, msg: Message) -> ApiResult<()> {
         #[allow(unused_variables)]
         match &msg {
@@ -455,6 +493,10 @@ impl Z2mBackend {
             );
             err
         })?;
+
+        if msg.topic == "bridge/logging" {
+            self.entertainment_ack(&msg.payload);
+        }
 
         /* bridge messages are handled differently. everything else is a device message */
         if !msg.topic.starts_with("bridge/") {
