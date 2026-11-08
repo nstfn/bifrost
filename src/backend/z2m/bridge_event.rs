@@ -373,8 +373,9 @@ impl Z2mBackend {
     }
 
     /// Feed the entertainment flow control with a `bridge/logging` payload
-    /// (`{"level", "message", "namespace"}`) that reports the completion of
-    /// a frame. The caller flushes the waiting frame afterwards.
+    /// (`{"level", "message"}`, plus `"namespace"` on newer zigbee2mqtt) that
+    /// reports the completion of a frame. The caller flushes the waiting
+    /// frame afterwards.
     fn entertainment_ack(&mut self, payload: &Value) {
         let Some(es) = &self.entstream else {
             return;
@@ -383,8 +384,9 @@ impl Z2mBackend {
         let Some(message) = field("message") else {
             return;
         };
+        let (namespace, message) = flow::split_log(field("namespace"), message);
 
-        let ack = if field("namespace") == Some("zhc:tz")
+        let ack = if namespace == Some("zhc:tz")
             && let Some(data) = flow::parse_invoked(message)
         {
             self.flow.ack_data(&data)

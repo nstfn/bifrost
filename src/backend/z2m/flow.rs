@@ -212,3 +212,52 @@ pub fn parse_invoked(message: &str) -> Option<Vec<u8>> {
         .ok()
         .map(|payload| payload.data)
 }
+
+/// Namespace and text of a `bridge/logging` line.
+///
+/// Newer zigbee2mqtt sends the namespace in its own field. zigbee2mqtt 2.14.3
+/// (on HAOS, 2026-11-08) has no such field and puts it at the start of the
+/// message instead: `"zhc:tz: Invoked ZCL command ..."`,
+/// `"z2m: Publish 'set' ..."` (captured on its websocket). Without this, no
+/// ack matched and the flow fell to ~1 frame/s.
+#[must_use]
+pub fn split_log<'a>(namespace: Option<&'a str>, message: &'a str) -> (Option<&'a str>, &'a str) {
+    if namespace.is_some() {
+        return (namespace, message);
+    }
+    match message.split_once(": ") {
+        Some((head, text)) if !head.is_empty() && !head.contains(char::is_whitespace) => {
+            (Some(head), text)
+        }
+        _ => (None, message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_invoked, split_log};
+
+    #[test]
+    fn split_log_reads_both_zigbee2mqtt_formats() {
+        // As captured from zigbee2mqtt 2.14.3: namespace inside the message.
+        let msg = "zhc:tz: Invoked ZCL command 64513.1 with payload '{\"data\":[38,0,0,0,170,6]}'";
+        let (ns, text) = split_log(None, msg);
+        assert_eq!(ns, Some("zhc:tz"));
+        assert_eq!(parse_invoked(text), Some(vec![38, 0, 0, 0, 170, 6]));
+
+        let msg = "z2m: Publish 'set' 'zclcommand' to 'Hue Play gradient - TV' failed: 'Error'";
+        let (ns, text) = split_log(None, msg);
+        assert_eq!(ns, Some("z2m"));
+        assert!(text.starts_with("Publish 'set' 'zclcommand' to 'Hue Play gradient - TV' failed"));
+
+        // Newer zigbee2mqtt: namespace in its own field, message untouched.
+        let msg = "Invoked ZCL command 64513.1 with payload '{\"data\":[1]}'";
+        assert_eq!(split_log(Some("zhc:tz"), msg), (Some("zhc:tz"), msg));
+
+        // A message without a namespace prefix stays whole.
+        assert_eq!(
+            split_log(None, "plain text: here"),
+            (None, "plain text: here")
+        );
+    }
+}
