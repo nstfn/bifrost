@@ -1,155 +1,77 @@
-![](doc/logo-title-640x160.png)
+# Bifrost (nstfn)
 
-# Bifrost Bridge
+A Hue bridge emulator backed by Zigbee2MQTT, for one home. Its main job: let
+[lg-hue-sync (nstfn)](https://github.com/nstfn/lg-hue-sync) on an LG TV drive a Philips Hue Play
+gradient lightstrip (LCX002, 7 segments) in Hue Entertainment mode, without a Hue Bridge. It also
+exposes the home's Zigbee lights to Hue apps.
 
-Bifrost enables you to emulate a Philips Hue Bridge to control lights, groups
-and scenes from [Zigbee2Mqtt](https://www.zigbee2mqtt.io/).
+This is a fork of [duvholt/bifrost](https://github.com/duvholt/bifrost). It is tuned for this
+setup, and it no longer follows upstream. Thanks to Bifrost's authors and contributors for the
+emulator this work starts from.
 
-If you are already familiar with [DiyHue](https://github.com/diyhue/diyHue), you
-might like to read the [comparison with DiyHue](doc/comparison-with-diyhue.md).
+## The setup it targets
 
-Questions, feedback, comments? Join us on discord
+- Home Assistant OS on a Raspberry Pi 5, with the app "Bifrost (nstfn)" from
+  [nstfn/bifrost-hassio](https://github.com/nstfn/bifrost-hassio) (no host network).
+- Zigbee2MQTT 2.14.3; Zigbee coordinator on the network (CC2652P over TCP).
+- One entertainment area, one paired app (lg-hue-sync), `auth.mode: strict`,
+  `streaming_fps: 15`.
 
-[![Join Valhalla on Discord](https://discordapp.com/api/guilds/1276604041727578144/widget.png?style=banner2)](https://discord.gg/YvBKjHBJpA)
+## How this fork diverges
 
-## Installation guide
+Upstream base: `d29b1d1` (2026-11-04). This fork adds 22 commits. Six of them are PR #39 by
+twenty5schmeckels (LCX002 segment layout), which upstream has merged since.
 
-There are currently three ways you can install Bifrost:
+- **Entertainment frames cannot pile up in Zigbee2MQTT.** zigbee-herdsman sends to one device
+  one request at a time (~52 ms per frame to this strip). Fire-and-forget frames used to queue
+  there, and the strip showed the picture seconds late. Now Bifrost keeps only the latest frame
+  and sends it after Zigbee2MQTT reports the previous one done (`70c22d2`, `189d9be`):
+  - the frame's `zclcommand` sets `"logging": true`, so Zigbee2MQTT logs
+    `Invoked ZCL command ...` when the frame completes, or `Publish 'set' 'zclcommand' ... failed`;
+  - Bifrost reads these lines on `bridge/logging` over the websocket it already holds, with the
+    namespace in its own field (newer Zigbee2MQTT) or at the start of the message (2.14);
+  - without an ack, a second frame may go after 300 ms, never more than 2 within 2 s;
+  - Bifrost logs `first completion ack` at stream start, and warns after 5 s without one.
 
-1.  [Install manually](#manual) from source (recommended)
-2.  [Install it via Docker](#docker) for container-based deployment.
-3.  Install as Home Assistant Add-on. Please see the
-    [bifrost-hassio](https://github.com/duvholt/bifrost-hassio) project for
-    more information.
+  Cost: one Zigbee2MQTT info log line per frame, about 20 MB of Zigbee2MQTT log per hour of
+  streaming (measured).
+- **No retry of a failed frame.** Entertainment frames use `disableRecovery`: a failed frame is
+  dropped, not retried for seconds behind the next ones (`1af135e`).
+- **Strict auth (opt-in).** Per-app keys and a virtual link button; the streamer's key no longer
+  leaks and is cleared on delete; `GET /api/<unknown user>/config` returns the short public
+  config, as a real bridge does; expected rejections no longer log at error level (`3ff499f`,
+  `e216c6b`, `18fda94`, `f82c4e8`, `2a13187`, `de8eb4a`).
+- **Entertainment API.** Accepts the `type` field when an entertainment configuration is created,
+  as the Hue app sends it (`a62da0f`); ends the stream session as soon as its area stops
+  (`eae6682`); schedules the throttle by deadline, so frames pass at the configured rate
+  (`a194626`).
+- **Images.** CI publishes `ghcr.io/nstfn/bifrost:nstfn-main-YYYY-MM-DD` and
+  `nstfn-main-latest` from `nstfn/main`, and runs the Rust checks there (`beaad53`, `d227b3c`,
+  `395e84f`). Docs for `bridge.bind_ipaddress` (`97e85a4`).
 
-### Manual
+## Install
 
-To install Bifrost from source, you will need the following:
+Add the app repository `https://github.com/nstfn/bifrost-hassio#nstfn/main` in Home Assistant
+and install "Bifrost (nstfn)". To ship a new build:
 
-1.  The rust language toolchain (https://rustup.rs/)
-2.  At least one zigbee2mqtt server to connect to
-3.  The MAC address of the network interface you want to run the server on
-4.  `build-essential` package for compiling the source code (on Debian/Ubuntu systems)
+1. Push to `nstfn/main`. CI publishes the image with today's date tag.
+2. In `bifrost-hassio`, set that tag in `bifrost-nstfn/build.yaml` and the same version in
+   `bifrost-nstfn/config.yaml`.
+3. Reload the app store and update the app with a backup.
 
-First, install a few necessary build dependencies:
+The Supervisor accepts `build_from` only as `image:tag`. With `image@sha256:...` it falls back to
+its default base image and starts a container without Bifrost. It builds with `--pull`, so a
+moved tag is fetched again.
 
-```sh
-sudo apt install build-essential pkg-config libssl3 libssl-dev
-```
+Configuration reference: [doc/config-reference.md](doc/config-reference.md).
 
-When you have these things available, install bifrost:
+## Known gaps
 
-```sh
-cargo install --git https://github.com/duvholt/bifrost.git
-```
+- `cargo clippy --all-targets -- -D warnings` fails with Rust 1.99 in `crates/svc` and
+  `crates/hue` (code from upstream). CI runs clippy without `-D warnings`.
+- `tests/zone.rs` `empty_zone_can_acquire_first_child` fails on macOS; it passes in CI on Linux.
+- The frame flow state machine (`src/backend/z2m/flow.rs`) has one test, for the log formats.
 
-After Cargo has finished downloading, compiling, and installing Bifrost, you
-should have the "bifrost" command available to you.
+## License
 
-The last step is to create a configuration for bifrost, `config.yaml`.
-
-Here's a minimal example:
-
-```yaml
-bridge:
-  name: Bifrost
-  mac: 00:11:22:33:44:55
-  ipaddress: 10.12.0.20
-  netmask: 255.255.255.0
-  gateway: 10.12.0.1
-  timezone: Europe/Copenhagen
-
-z2m:
-  server1:
-    url: ws://10.0.0.100:8080
-```
-
-Please adjust this as needed. Particularly, make **sure** the "mac:" field
-matches a mac address on the network interface you want to serve requests from.
-
-Make sure to read the [configuration reference](doc/config-reference.md) to
-learn how to adjust the configuration file.
-
-This mac address if used to generate a self-signed certificate, so the Hue App
-will recognize this as a "real" Hue Bridge. If the mac address is incorrect,
-this will not work. [How to find your mac address](doc/how-to-find-mac-linux.md).
-
-Now you can start Bifrost. Simple start the "bifrost" command from the same
-directory where you put the `config.yaml`:
-
-```sh
-bifrost
-```
-
-At this point, the server should start: (log timestamps omitted for clarity)
-
-```
-  ===================================================================
-   ███████████   ███     ██████                              █████
-  ░░███░░░░░███ ░░░     ███░░███                            ░░███
-   ░███    ░███ ████   ░███ ░░░  ████████   ██████   █████  ███████
-   ░██████████ ░░███  ███████   ░░███░░███ ███░░███ ███░░  ░░░███░
-   ░███░░░░░███ ░███ ░░░███░     ░███ ░░░ ░███ ░███░░█████   ░███
-   ░███    ░███ ░███   ░███      ░███     ░███ ░███ ░░░░███  ░███ ███
-   ███████████  █████  █████     █████    ░░██████  ██████   ░░█████
-  ░░░░░░░░░░░  ░░░░░  ░░░░░     ░░░░░      ░░░░░░  ░░░░░░     ░░░░░
-  ===================================================================
-
-  DEBUG bifrost > Configuration loaded successfully
-  DEBUG bifrost::server::certificate > Found existing certificate for bridge id [001122fffe334455]
-  DEBUG bifrost::state               > Existing state file found, loading..
-  INFO  bifrost::mdns                > Registered service bifrost-001122334455._hue._tcp.local.
-  INFO  bifrost                      > Serving mac [00:11:22:33:44:55]
-  DEBUG bifrost::state               > Loading certificate from [cert.pem]
-  INFO  bifrost::server              > http listening on 10.12.0.20:80
-  INFO  bifrost::server              > https listening on 10.12.0.20:443
-  INFO  bifrost::z2m                 > [server1] Connecting to ws://10.0.0.100:8080
-  DEBUG tungstenite::handshake::client > Client handshake done.
-  DEBUG tungstenite::handshake::client > Client handshake done.
-  DEBUG bifrost::z2m                   > [server1] Ignoring unsupported device Coordinator
-  INFO  bifrost::z2m                   > [server1] Adding light IeeeAddress(000000fffe111111): [office_1] (TRADFRI bulb GU10 CWS 345lm)
-  INFO  bifrost::z2m                   > [server1] Adding light IeeeAddress(222222fffe333333): [office_2] (TRADFRI bulb GU10 CWS 345lm)
-  INFO  bifrost::z2m                   > [server1] Adding light IeeeAddress(444444fffe555555): [office_3] (TRADFRI bulb GU10 CWS 345lm)
-...
-```
-
-The log output shows Bifrost talking with zigbee2mqtt, and finding some lights to control (office\_{1,2,3}).
-
-At this point, you're running a Bifrost bridge.
-
-The Philips Hue app should be able to find it on your network!
-
-### Docker
-
-#### Docker Installation
-
-To install Bifrost with Docker, you will need the following:
-
-1.  At least one zigbee2mqtt server to connect to
-2.  The MAC address of the network interface you want to run the server on
-3.  A running [Docker](https://docs.docker.com/engine/install/) instance
-    with [Docker-Compose](https://docs.docker.com/compose/install/) installed
-4.  Have `git` installed to clone this repository
-
-Please choose one of the following installation methods:
-
-- [Install using Docker Compose](doc/docker-compose-install.md) (recommended for most users)
-- [Install using Docker Image](doc/docker-image-install.md) (for direct image pulls)
-
-# Configuration
-
-See [configuration reference](doc/config-reference.md).
-
-# Problems? Questions? Feedback?
-
-Please note: Bifrost is a very young project. Some things are incomplete, and/or
-broken when they shouldn't be.
-
-Consider joining us on discord:
-
-[![Join Valhalla on Discord](https://discordapp.com/api/guilds/1276604041727578144/widget.png?style=banner2)](https://discord.gg/YvBKjHBJpA)
-
-If you have any problems, questions or suggestions, feel free to [create an
-issue](https://github.com/duvholt/bifrost/issues) on this project.
-
-Also, pull requests are always welcome!
+[GPL-3.0](LICENSE), as upstream.
